@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -38,6 +39,15 @@ class ServiceError(Exception):
 def _mcp_command():
     command = os.getenv("PLAUD_MCP_COMMAND", "npx")
     args = os.getenv("PLAUD_MCP_ARGS", "-y @plaud-ai/mcp@latest").split()
+
+    # `npx -y pacote@latest` consulta o registro do npm a cada chamada, o que no
+    # servidor estoura o timeout do balanceador. Se o pacote já estiver instalado
+    # na imagem, o binário local faz a mesma coisa em milissegundos.
+    if command == "npx":
+        binario = shutil.which("plaud-mcp")
+        if binario:
+            command, args = binario, []
+
     return StdioServerParameters(command=command, args=args)
 
 
@@ -57,13 +67,21 @@ async def _call_plaud(tool_name, arguments=None):
                 return payload
 
 
+def _causa(error):
+    """O MCP embrulha tudo em ExceptionGroup, cuja mensagem não diz nada útil."""
+    while isinstance(error, BaseExceptionGroup) and error.exceptions:
+        error = error.exceptions[0]
+    return f"{type(error).__name__}: {error}"
+
+
 def plaud_call(tool_name, arguments=None):
+    plaud_token.garantir()
     try:
         return asyncio.run(_call_plaud(tool_name, arguments))
     except ServiceError:
         raise
     except Exception as error:
-        raise ServiceError(f"Não foi possível conectar à Plaud MCP: {error}") from error
+        raise ServiceError(f"Não foi possível conectar à Plaud MCP: {_causa(error)}") from error
     finally:
         # O MCP pode ter renovado (e rotacionado) o token durante a chamada.
         plaud_token.sincronizar()

@@ -48,6 +48,18 @@ def restaurar():
     return True
 
 
+def garantir():
+    """Restaura o token se ele não estiver em disco.
+
+    O `restaurar()` do boot pode falhar por motivo passageiro — banco ainda
+    bloqueado no firewall, rede fora — e sem isso o app ficaria quebrado até
+    alguém reiniciar. Verificar antes de cada chamada custa um stat de arquivo.
+    """
+    if TOKEN_PATH.is_file():
+        return
+    restaurar()
+
+
 def sincronizar():
     """Sobe o token ao banco quando o MCP o renova. Barato: o arquivo tem ~1 KB."""
     global _ultimo_visto
