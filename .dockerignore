@@ -1,0 +1,9 @@
+**/.venv
+**/node_modules
+**/dist
+**/__pycache__
+**/*.pyc
+**/.env
+**/.DS_Store
+.do
+README.md

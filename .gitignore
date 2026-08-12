@@ -1,0 +1,16 @@
+# Segredos: GEMINI_API_KEY, chave de serviço do Supabase.
+.env
+.env.local
+*.local
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Node / build
+node_modules/
+dist/
+backend/static/
+
+.DS_Store

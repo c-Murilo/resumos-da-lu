@@ -1,0 +1,53 @@
+# Spec do DigitalOcean App Platform.
+# Suba com: doctl apps create --spec .do/app.yaml
+# (ou cole no painel: Create App > escolha o repo > Edit Spec)
+
+name: resumos-da-lu
+region: nyc
+
+services:
+  - name: web
+    instance_size_slug: apps-s-1vcpu-0.5gb
+    instance_count: 1
+    http_port: 8080
+
+    dockerfile_path: Dockerfile
+    source_dir: /
+
+    github:
+      repo: SEU-USUARIO/system-luiza
+      branch: main
+      deploy_on_push: true
+
+    health_check:
+      http_path: /api/health
+      initial_delay_seconds: 20
+      period_seconds: 30
+
+    envs:
+      - key: GEMINI_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: COLE_NO_PAINEL
+
+      - key: SUPABASE_URL
+        scope: RUN_TIME
+        value: https://oymirslixudstdcmdyfw.supabase.co
+
+      - key: SUPABASE_SERVICE_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: COLE_NO_PAINEL
+
+      # Resumo automático das gravações novas, varrendo a cada 5 minutos.
+      - key: AUTO_RESUMO
+        scope: RUN_TIME
+        value: "1"
+      - key: AUTO_RESUMO_INTERVALO
+        scope: RUN_TIME
+        value: "300"
+
+      # Front e API no mesmo domínio: CORS não entra em jogo.
+      - key: FRONTEND_ORIGIN
+        scope: RUN_TIME
+        value: ""
