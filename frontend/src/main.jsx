@@ -50,7 +50,12 @@ function App() {
   const [models, setModels] = useState([])
   const [model, setModel] = useState('')
   const [slide, setSlide] = useState(0)
+  const [aba, setAba] = useState('plaud')
+  const [salvos, setSalvos] = useState([])
   const chatEnd = useRef(null)
+
+  const prontos = new Set(salvos.map(item => item.id))
+  const lista = aba === 'salvos' ? salvos : recordings
 
   // silencioso: atualização de fundo não pisca a lista nem mostra erro de rede.
   async function load({ silent = false } = {}) {
@@ -63,6 +68,14 @@ function App() {
     } catch (err) {
       if (!silent) setError(err.message || 'Não foi possível carregar as gravações.')
     } finally { if (!silent) setLoading(false) }
+    carregarSalvos()
+  }
+
+  async function carregarSalvos() {
+    try {
+      const response = await fetch(`${API}/resumos`)
+      if (response.ok) setSalvos(await response.json())
+    } catch { /* biblioteca é complemento: falhar aqui não atrapalha a lista */ }
   }
 
   useEffect(() => { load() }, [])
@@ -116,6 +129,7 @@ function App() {
       // body.id é o id no Supabase; o da Plaud vem separado para não se atropelarem.
       setResult({ ...body, recordingId: recording.id, name: recording.name || body.nome })
       setChat(body.historico || [])
+      carregarSalvos()  // acabou de virar uma resumida; a aba precisa saber
     } catch (err) { setError(err.message || 'Não foi possível processar o áudio.') }
     finally { setSelected(null) }
   }
@@ -150,7 +164,16 @@ function App() {
 
     <section id="gravacoes" className="workspace">
       <div className="workspace-head">
-        <div><p className="section-label">BIBLIOTECA</p><h2>Suas gravações</h2></div>
+        <div>
+          <p className="section-label">BIBLIOTECA</p>
+          <h2>Suas gravações</h2>
+          <div className="abas">
+            <button className={aba === 'plaud' ? 'ativa' : ''} onClick={() => setAba('plaud')}>Da Plaud</button>
+            <button className={aba === 'salvos' ? 'ativa' : ''} onClick={() => setAba('salvos')}>
+              Resumidas {salvos.length > 0 && <i>{salvos.length}</i>}
+            </button>
+          </div>
+        </div>
         <div className="head-tools">
           {models.length > 1 && <label className="model-picker">
             <span>modelo</span>
@@ -168,16 +191,22 @@ function App() {
 
       <section className="grid">
         <div className="panel recordings-panel">
-          {loading ? <div className="loading"><span /><p>Buscando suas conversas…</p></div>
-            : recordings.length === 0 ? <div className="empty"><span>◌</span><p>Nenhuma gravação por aqui ainda.</p></div>
-              : recordings.map((item, index) => <article className="recording" style={{ animationDelay: `${index * 45}ms` }} key={item.id}>
-                <button className="play" aria-label="Processar gravação" disabled={selected === item.id} onClick={() => process(item)}><Play /></button>
+          {loading && aba === 'plaud' ? <div className="loading"><span /><p>Buscando suas conversas…</p></div>
+            : lista.length === 0 ? <div className="empty"><span>◌</span>
+              <p>{aba === 'salvos' ? 'Nenhum resumo guardado ainda.' : 'Nenhuma gravação por aqui ainda.'}</p>
+            </div>
+              : lista.map((item, index) => <article className="recording" style={{ animationDelay: `${index * 45}ms` }} key={item.id}>
+                <button className="play" aria-label="Abrir gravação" disabled={selected === item.id} onClick={() => process(item)}><Play /></button>
                 <div className="recording-info">
                   <strong>{item.name || 'Sem título'}</strong>
-                  <span>{date(item.created_at || item.start_at)} <b>·</b> {Math.max(1, Math.round((item.duration || 0) / 60000))} min</span>
+                  <span>
+                    {date(item.created_at || item.start_at)} <b>·</b> {Math.max(1, Math.round((item.duration || 0) / 60000))} min
+                    {prontos.has(item.id) && <em className="tag-pronto">resumida</em>}
+                  </span>
                 </div>
                 <button className="summarize" disabled={selected === item.id} onClick={() => process(item)}>
-                  {selected === item.id ? <><i className="button-loader" /> lendo</> : <>resumir <span>→</span></>}
+                  {selected === item.id ? <><i className="button-loader" /> lendo</>
+                    : prontos.has(item.id) ? <>abrir <span>→</span></> : <>resumir <span>→</span></>}
                 </button>
               </article>)}
         </div>

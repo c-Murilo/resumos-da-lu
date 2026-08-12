@@ -16,6 +16,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from werkzeug.exceptions import HTTPException
 
+import audio
 import plaud_token
 import storage
 
@@ -170,25 +171,96 @@ def _generation_config(**extra):
     return config
 
 
-def transcribe(client, uploaded, model):
-    """Etapa 1: só a transcrição, para o teto de saída ser gasto inteiro com ela."""
-    try:
-        generated = client.models.generate_content(
-            model=model,
-            contents=[uploaded, "Transcreva esta aula segundo as instruções do sistema."],
-            config=_generation_config(system_instruction=load_system_prompt("TRANSCRIPT_PROMPT_FILE", "prompt_transcricao.md")),
-        )
-    except Exception as error:
-        raise ServiceError(f"Falha ao transcrever o áudio: {error}") from error
+TENTATIVAS_POR_MODELO = 3
+ESPERA_ENTRE_TENTATIVAS = 4  # segundos, dobrando a cada falha
+ERROS_TEMPORARIOS = ("503", "429", "500", "504", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded")
 
-    transcript = (generated.text or "").strip()
-    if not transcript:
-        raise ServiceError("A Gemini não devolveu transcrição para este áudio.")
+
+def _cadeia_de_modelos(preferido):
+    """Modelo escolhido primeiro; depois os reservas de GEMINI_FALLBACK."""
+    reservas = os.getenv("GEMINI_FALLBACK", "gemini-3.5-flash").split(",")
+    cadeia = [preferido] + [item.strip() for item in reservas if item.strip()]
+    return list(dict.fromkeys(cadeia))  # sem repetir, preservando a ordem
+
+
+def _temporario(error):
+    texto = str(error)
+    return any(marca in texto for marca in ERROS_TEMPORARIOS)
+
+
+def gerar(client, modelo, contents, config, tarefa):
+    """Tenta 3 vezes no modelo pedido e, se ele estiver fora, cai para o reserva."""
+    ultimo = None
+    for atual in _cadeia_de_modelos(modelo):
+        for tentativa in range(1, TENTATIVAS_POR_MODELO + 1):
+            try:
+                return client.models.generate_content(model=atual, contents=contents, config=config)
+            except Exception as error:
+                ultimo = error
+                if not _temporario(error):
+                    raise ServiceError(f"Falha ao {tarefa}: {error}") from error
+                app.logger.warning(
+                    "%s: %s falhou (tentativa %s/%s): %s",
+                    tarefa, atual, tentativa, TENTATIVAS_POR_MODELO, str(error)[:120],
+                )
+                if tentativa < TENTATIVAS_POR_MODELO:
+                    time.sleep(ESPERA_ENTRE_TENTATIVAS * tentativa)
+        app.logger.warning("%s: desistindo de %s, tentando o próximo modelo", tarefa, atual)
+    raise ServiceError(f"Falha ao {tarefa}, mesmo trocando de modelo: {ultimo}")
+
+
+def _transcrever_bloco(client, caminho, model, anterior, parte, total):
+    uploaded = client.files.upload(file=caminho)
+    try:
+        instrucao = "Transcreva esta aula segundo as instruções do sistema."
+        if total > 1:
+            instrucao = (
+                f"Este é o bloco {parte} de {total} da MESMA aula, em sequência.\n"
+                "Transcreva apenas o que ouvir neste bloco. Não recomece, não resuma o anterior "
+                "e mantenha a mesma identificação de falantes.\n"
+            )
+            if anterior:
+                instrucao += f"\nFim do bloco anterior, só para dar continuidade:\n...{anterior[-600:]}"
+        generated = gerar(
+            client, model, [uploaded, instrucao],
+            _generation_config(system_instruction=load_system_prompt("TRANSCRIPT_PROMPT_FILE", "prompt_transcricao.md")),
+            "transcrever o áudio",
+        )
+    finally:
+        try:
+            client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
+
     if _hit_output_limit(generated):
         raise ServiceError(
-            "A aula é longa demais: a transcrição foi cortada no limite de saída. "
-            "Aumente GEMINI_MAX_OUTPUT_TOKENS ou grave a aula em partes."
+            "A transcrição foi cortada no limite de saída mesmo em blocos. "
+            "Reduza AUDIO_BLOCO_MINUTOS ou aumente GEMINI_MAX_OUTPUT_TOKENS."
         )
+    return (generated.text or "").strip()
+
+
+def transcribe(client, caminho, model):
+    """Etapa 1: transcrição, em blocos quando a aula é longa."""
+    minutos = int(os.getenv("AUDIO_BLOCO_MINUTOS", "40"))
+    blocos = audio.dividir(caminho, minutos * 60)
+    if len(blocos) > 1:
+        app.logger.info("Áudio dividido em %s blocos de até %s min", len(blocos), minutos)
+
+    partes = []
+    try:
+        for indice, bloco in enumerate(blocos, start=1):
+            texto = _transcrever_bloco(client, bloco, model, "\n\n".join(partes), indice, len(blocos))
+            if texto:
+                partes.append(texto)
+    finally:
+        for bloco in blocos:
+            if bloco != caminho:
+                Path(bloco).unlink(missing_ok=True)
+
+    transcript = "\n\n".join(partes).strip()
+    if not transcript:
+        raise ServiceError("A Gemini não devolveu transcrição para este áudio.")
     return transcript
 
 
@@ -204,17 +276,14 @@ Retorne APENAS JSON válido com estas chaves:
  "estudo": "string em Markdown",
  "slides": [{{"titulo": "string", "topicos": ["string"], "nota": "string"}}]}}
 Siga as instruções do sistema para o conteúdo de cada campo."""
-    try:
-        generated = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=_generation_config(
-                system_instruction=load_system_prompt(),
-                response_mime_type="application/json",
-            ),
-        )
-    except Exception as error:
-        raise ServiceError(f"Falha ao gerar o material de estudo: {error}") from error
+    generated = gerar(
+        client, model, prompt,
+        _generation_config(
+            system_instruction=load_system_prompt(),
+            response_mime_type="application/json",
+        ),
+        "gerar o material de estudo",
+    )
 
     if _hit_output_limit(generated):
         raise ServiceError(
@@ -243,19 +312,13 @@ def process_audio(file_info, model):
 
     suffix = Path(audio_url.split("?", 1)[0]).suffix or ".audio"
     temp_path = None
-    uploaded = None
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
             temp_file.write(response.content)
             temp_path = temp_file.name
-        uploaded = client.files.upload(file=temp_path)
-        transcript = transcribe(client, uploaded, model)
+        # O upload agora acontece por bloco, dentro de transcribe.
+        transcript = transcribe(client, temp_path, model)
     finally:
-        if uploaded:
-            try:
-                client.files.delete(name=uploaded.name)
-            except Exception:
-                pass
         if temp_path:
             Path(temp_path).unlink(missing_ok=True)
 
@@ -341,6 +404,27 @@ def _resumo_salvo(recording_id):
     except storage.StorageError:
         saved["historico"] = []
     return saved
+
+
+@app.get("/api/resumos")
+def list_resumos():
+    """Biblioteca do que já foi gerado. Independe da Plaud estar respondendo."""
+    if not storage.enabled():
+        return jsonify([])
+    try:
+        salvos = storage.listar_resumos()
+    except storage.StorageError as error:
+        app.logger.warning("Falha ao listar resumos: %s", error)
+        return jsonify([])
+    # Mesmo formato da lista da Plaud, para o front renderizar o mesmo cartão.
+    return jsonify([{
+        "id": item["recording_id"],
+        "name": item.get("nome"),
+        "created_at": item.get("gravado_em") or item.get("criado_em"),
+        "duration": item.get("duracao_ms"),
+        "modelo": item.get("modelo"),
+        "resumido": True,
+    } for item in salvos])
 
 
 @app.get("/api/recordings/<recording_id>/resumo")
@@ -452,7 +536,17 @@ def _pagina_do_app():
 
 plaud_token.restaurar()
 
-if os.getenv("AUTO_RESUMO", "").strip() == "1":
+def _ligar_auto_resumo():
+    if os.getenv("AUTO_RESUMO", "").strip() != "1":
+        return
+    # Com `flask --debug` o reloader roda o módulo duas vezes; só o processo
+    # filho (WERKZEUG_RUN_MAIN) deve varrer, senão a Plaud é consultada em dobro.
+    if app.debug and os.getenv("WERKZEUG_RUN_MAIN") != "true":
+        return
+
     import auto_resumo
 
     auto_resumo.iniciar(app, sys.modules[__name__], int(os.getenv("AUTO_RESUMO_INTERVALO", "300")))
+
+
+_ligar_auto_resumo()

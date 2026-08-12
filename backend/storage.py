@@ -63,7 +63,8 @@ def buscar_resumo(recording_id):
 
 def listar_resumos():
     """Só os campos que a lista precisa — evita trafegar transcrição inteira."""
-    return _request("GET", "resumos?select=recording_id,nome,modelo,criado_em&order=criado_em.desc")
+    campos = "recording_id,nome,modelo,gravado_em,duracao_ms,criado_em"
+    return _request("GET", f"resumos?select={campos}&order=criado_em.desc")
 
 
 def salvar_pergunta(resumo_id, pergunta, resposta, modelo):
