@@ -1,4 +1,4 @@
-"""Envia o token da Plaud desta máquina para o Supabase.
+"""Envia o token da Plaud desta máquina para o MongoDB.
 
 Rode uma vez, depois do `npx -y @plaud-ai/mcp@latest install`:
 
@@ -33,7 +33,7 @@ def main():
         sys.exit("O token não tem refresh_token; refaça o login na Plaud.")
 
     storage.salvar_token(conteudo)
-    print(f"Token enviado ao Supabase ({len(json.dumps(conteudo))} bytes).")
+    print(f"Token enviado ao MongoDB ({len(json.dumps(conteudo))} bytes).")
     print("O deploy no App Platform já consegue falar com a Plaud.")
 
 

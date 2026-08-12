@@ -2,7 +2,7 @@
 
 O servidor MCP só sabe ler e escrever `~/.plaud/tokens-mcp.json`. Num container
 efêmero esse arquivo nasce vazio e morre no redeploy, então aqui ele é
-espelhado no Supabase: restaurado ao subir, e regravado sempre que o MCP o
+espelhado no MongoDB: restaurado ao subir, e regravado sempre que o MCP o
 renova (o refresh token pode rotacionar, e perder a rotação quebra o login).
 """
 

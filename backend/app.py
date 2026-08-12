@@ -395,15 +395,47 @@ def _resumo_salvo(recording_id):
     try:
         saved = storage.buscar_resumo(recording_id)
     except storage.StorageError as error:
-        app.logger.warning("Falha ao ler do Supabase: %s", error)
+        app.logger.warning("Falha ao ler do MongoDB: %s", error)
         return None
     if not saved:
         return None
     try:
-        saved["historico"] = storage.listar_perguntas(saved["id"])
+        saved["historico"] = storage.listar_perguntas(recording_id)
     except storage.StorageError:
         saved["historico"] = []
     return saved
+
+
+@app.get("/api/diagnostico")
+def diagnostico():
+    """Sem segredos: só diz o que está configurado e o que a Plaud responde."""
+    import shutil
+
+    comando = os.getenv("PLAUD_MCP_COMMAND", "npx")
+    estado = {
+        "gemini_key": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+        "mongodb_configurado": storage.enabled(),
+        "mcp_comando": comando,
+        "mcp_encontrado": bool(shutil.which(comando)),
+        "token_em_disco": plaud_token.TOKEN_PATH.is_file(),
+        "token_no_banco": None,
+        "plaud": None,
+    }
+
+    if storage.enabled():
+        try:
+            estado["token_no_banco"] = bool(storage.buscar_token())
+        except storage.StorageError as error:
+            estado["token_no_banco"] = f"erro: {error}"
+
+    try:
+        payload = extract_file_payload(plaud_call("list_files", {}))
+        dados = payload["data"] if isinstance(payload, dict) else payload
+        estado["plaud"] = f"ok, {len(dados)} gravações"
+    except Exception as error:
+        estado["plaud"] = f"erro: {str(error)[:200]}"
+
+    return jsonify(estado)
 
 
 @app.get("/api/resumos")
@@ -467,7 +499,7 @@ def process_recording(recording_id):
                 resultado["id"] = linha["id"]
         except storage.StorageError as error:
             # Perder o histórico é ruim, mas não justifica descartar o resumo pronto.
-            app.logger.warning("Falha ao salvar no Supabase: %s", error)
+            app.logger.warning("Falha ao salvar no MongoDB: %s", error)
 
     resultado["historico"] = []
     return jsonify(resultado)
@@ -488,12 +520,11 @@ def ask_recording(recording_id):
     model = resolve_model(body.get("modelo"))
     resposta = answer_question(transcript, question, history, model)
 
-    resumo_id = body.get("resumo_id")
-    if storage.enabled() and resumo_id:
+    if storage.enabled():
         try:
-            storage.salvar_pergunta(resumo_id, question, resposta, model)
+            storage.salvar_pergunta(recording_id, question, resposta, model)
         except storage.StorageError as error:
-            app.logger.warning("Falha ao salvar a pergunta no Supabase: %s", error)
+            app.logger.warning("Falha ao salvar a pergunta no MongoDB: %s", error)
 
     return jsonify({"resposta": resposta, "modelo": model})
 

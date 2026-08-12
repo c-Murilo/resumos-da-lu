@@ -7,6 +7,24 @@ import './styles.css'
 const API = import.meta.env.VITE_API_URL || 'http://localhost:5001/api'
 const POLL_MS = 5 * 60 * 1000
 
+// Erro de gateway (502/504) devolve HTML, e `response.json()` estoura com
+// "Unexpected token '<'", que não diz nada. Aqui vira uma mensagem legível.
+async function lerResposta(response) {
+  const texto = await response.text()
+  try {
+    const corpo = JSON.parse(texto)
+    if (!response.ok) throw new Error(corpo.error || `Erro ${response.status} no servidor.`)
+    return corpo
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      throw new Error(response.status === 504
+        ? 'O servidor demorou demais ou reiniciou (504). Veja os logs do deploy.'
+        : `O servidor respondeu ${response.status} em vez de JSON.`)
+    }
+    throw err
+  }
+}
+
 function date(value) {
   return value ? new Intl.DateTimeFormat('pt-BR', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : 'Sem data'
 }
@@ -61,9 +79,7 @@ function App() {
   async function load({ silent = false } = {}) {
     if (!silent) { setLoading(true); setError('') }
     try {
-      const response = await fetch(`${API}/recordings?${new URLSearchParams(query ? { query } : {})}`)
-      const body = await response.json()
-      if (!response.ok) throw new Error(body.error)
+      const body = await lerResposta(await fetch(`${API}/recordings?${new URLSearchParams(query ? { query } : {})}`))
       setRecordings(Array.isArray(body) ? body : body.files || body.items || [])
     } catch (err) {
       if (!silent) setError(err.message || 'Não foi possível carregar as gravações.')
@@ -119,14 +135,11 @@ function App() {
   async function process(recording, forcar = false) {
     setSelected(recording.id); setResult(null); setError(''); setChat([]); setQuestion(''); setSlide(0)
     try {
-      const response = await fetch(`${API}/recordings/${recording.id}/process`, {
+      const body = await lerResposta(await fetch(`${API}/recordings/${recording.id}/process`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ modelo: model, forcar }),
-      })
-      const body = await response.json()
-      if (!response.ok) throw new Error(body.error)
-      // body.id é o id no Supabase; o da Plaud vem separado para não se atropelarem.
+      }))
       setResult({ ...body, recordingId: recording.id, name: recording.name || body.nome })
       setChat(body.historico || [])
       carregarSalvos()  // acabou de virar uma resumida; a aba precisa saber
@@ -139,13 +152,11 @@ function App() {
     if (!pergunta || asking || !result) return
     setQuestion(''); setAsking(true); setError('')
     try {
-      const response = await fetch(`${API}/recordings/${result.recordingId}/ask`, {
+      const body = await lerResposta(await fetch(`${API}/recordings/${result.recordingId}/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pergunta, transcricao: result.transcricao, historico: chat, modelo: model, resumo_id: result.id }),
-      })
-      const body = await response.json()
-      if (!response.ok) throw new Error(body.error)
+        body: JSON.stringify({ pergunta, transcricao: result.transcricao, historico: chat, modelo: model }),
+      }))
       setChat(current => [...current, { pergunta, resposta: body.resposta }])
     } catch (err) {
       setError(err.message || 'Não foi possível responder agora.')
