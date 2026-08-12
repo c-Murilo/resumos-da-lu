@@ -132,6 +132,13 @@ function App() {
   }
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }) }, [chat, asking])
 
+  // Abriu um resumo no celular: sobe até ele, senão o conteúdo nasce fora da tela.
+  useEffect(() => {
+    if (result && window.matchMedia('(max-width: 820px)').matches) {
+      document.getElementById('gravacoes')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }, [result?.recordingId])
+
   async function process(recording, forcar = false) {
     setSelected(recording.id); setResult(null); setError(''); setChat([]); setQuestion(''); setSlide(0)
     try {
@@ -200,7 +207,9 @@ function App() {
       </div>
       {error && <p className="error">{error}</p>}
 
-      <section className="grid">
+      {/* No celular os dois painéis empilham: com resultado aberto, ele toma a
+          tela inteira e a lista some, como num app de verdade. */}
+      <section className={`grid ${result || selected ? 'com-resultado' : ''}`}>
         <div className="panel recordings-panel">
           {loading && aba === 'plaud' ? <div className="loading"><span /><p>Buscando suas conversas…</p></div>
             : lista.length === 0 ? <div className="empty"><span>◌</span>
@@ -229,6 +238,7 @@ function App() {
             <h2>Já volto com o resumo.</h2>
             <p>Isso leva um instante.</p>
           </div> : result ? <>
+            <button className="voltar" onClick={() => { setResult(null); setChat([]) }}>← gravações</button>
             <div className="result-title">
               <div><p className="section-label">RESUMO</p><h2>{result.name || 'Sua conversa'}</h2></div>
               <div className="result-actions">

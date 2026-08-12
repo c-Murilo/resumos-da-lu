@@ -1,7 +1,7 @@
 /* Service worker do Resumos da Lu.
    Mantém a casca do app disponível offline; a API nunca é cacheada. */
 
-const VERSION = 'v1'
+const VERSION = 'v2'
 const SHELL = `shell-${VERSION}`
 const ASSETS = `assets-${VERSION}`
 const SHELL_URLS = ['/', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png']
