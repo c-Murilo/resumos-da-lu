@@ -112,7 +112,7 @@ def gemini_client():
 # Só entra em cena se a listagem ao vivo falhar (chave ausente, rede fora).
 FALLBACK_MODELS = "gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash"
 MODEL_CACHE_SECONDS = 600
-_model_cache = {"at": 0.0, "models": []}
+_model_cache = {"at": 0.0, "models": [], "saida": {}, "falhou_em": 0.0}
 
 
 EXCLUDED_MODEL_TAGS = ("image", "tts", "live", "native-audio", "embedding", "learnlm")
@@ -133,8 +133,11 @@ def _live_models():
     now = time.monotonic()
     if _model_cache["models"] and now - _model_cache["at"] < MODEL_CACHE_SECONDS:
         return _model_cache["models"]
+    # Listagem quebrada não é motivo para tentar de novo a cada chamada da Gemini.
+    if now - _model_cache["falhou_em"] < MODEL_CACHE_SECONDS:
+        return _model_cache["models"]
     try:
-        names = []
+        names, saida = [], {}
         client = gemini_client()  # precisa viver enquanto o paginador itera
         for model in client.models.list():
             actions = getattr(model, "supported_actions", None) or []
@@ -144,11 +147,16 @@ def _live_models():
             # Fora imagem, voz e embedding: aqui só interessa quem lê áudio e devolve texto.
             if name.startswith("gemini-") and not any(tag in name for tag in EXCLUDED_MODEL_TAGS):
                 names.append(name)
+                # O teto de saída varia por modelo; pedir acima dele é erro 400.
+                teto = getattr(model, "output_token_limit", None)
+                if isinstance(teto, int) and teto > 0:
+                    saida[name] = teto
     except Exception as error:
         app.logger.warning("Não foi possível listar modelos da Gemini: %s", error)
+        _model_cache["falhou_em"] = now
         return []
     names.sort(key=_model_rank)
-    _model_cache.update(at=now, models=names)
+    _model_cache.update(at=now, models=names, saida=saida)
     return names
 
 
@@ -182,11 +190,30 @@ def _hit_output_limit(generated):
 
 
 def _generation_config(**extra):
-    config = dict(extra)
-    limit = os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "").strip()
-    if limit.isdigit():
-        config["max_output_tokens"] = int(limit)
-    return config
+    """Sem max_output_tokens aqui: ele depende do modelo e entra em _com_saida()."""
+    return dict(extra)
+
+
+def _teto_desejado():
+    limite = os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "").strip()
+    return int(limite) if limite.isdigit() and int(limite) > 0 else 0
+
+
+def _com_saida(config, modelo):
+    """Aplica GEMINI_MAX_OUTPUT_TOKENS sem passar do teto que o modelo aceita.
+
+    Pedir mais do que o modelo suporta vira 400 INVALID_ARGUMENT, que não é erro
+    temporário e derrubaria a aula. Quando o teto do modelo é desconhecido
+    (listagem indisponível), vale o padrão da API.
+    """
+    desejado = _teto_desejado()
+    if not desejado:
+        return config
+    _live_models()  # popula o cache de tetos, com validade de 10 min
+    teto = _model_cache["saida"].get(modelo)
+    if not teto:
+        return config
+    return {**config, "max_output_tokens": min(desejado, teto)}
 
 
 TENTATIVAS_POR_MODELO = 3
@@ -194,11 +221,17 @@ ESPERA_ENTRE_TENTATIVAS = 4  # segundos, dobrando a cada falha
 ERROS_TEMPORARIOS = ("503", "429", "500", "504", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded")
 
 
-def _cadeia_de_modelos(preferido):
-    """Modelo escolhido primeiro; depois os reservas de GEMINI_FALLBACK."""
-    reservas = os.getenv("GEMINI_FALLBACK", "gemini-3.5-flash").split(",")
-    cadeia = [preferido] + [item.strip() for item in reservas if item.strip()]
-    return list(dict.fromkeys(cadeia))  # sem repetir, preservando a ordem
+def _cadeia_de_modelos(preferido, sessao=None):
+    """Modelo escolhido primeiro; depois os reservas de GEMINI_FALLBACK.
+
+    Dentro de uma mesma aula o material sai em várias chamadas (um trecho por
+    vez). Se a primeira caiu para o reserva, as seguintes começam por ele: uma
+    aula meio escrita por um modelo e meio por outro sai desencontrada no tom.
+    """
+    escolhido = (sessao or {}).get("modelo") or preferido
+    reservas = os.getenv("GEMINI_FALLBACK", "gemini-3.6-flash").split(",")
+    cadeia = [escolhido, preferido] + [item.strip() for item in reservas if item.strip()]
+    return list(dict.fromkeys(item for item in cadeia if item))  # sem repetir, na ordem
 
 
 def _temporario(error):
@@ -206,13 +239,20 @@ def _temporario(error):
     return any(marca in texto for marca in ERROS_TEMPORARIOS)
 
 
-def gerar(client, modelo, contents, config, tarefa):
+def gerar(client, modelo, contents, config, tarefa, sessao=None):
     """Tenta 3 vezes no modelo pedido e, se ele estiver fora, cai para o reserva."""
     ultimo = None
-    for atual in _cadeia_de_modelos(modelo):
+    for atual in _cadeia_de_modelos(modelo, sessao):
         for tentativa in range(1, TENTATIVAS_POR_MODELO + 1):
             try:
-                return client.models.generate_content(model=atual, contents=contents, config=config)
+                resposta = client.models.generate_content(
+                    model=atual, contents=contents, config=_com_saida(config, atual)
+                )
+                if sessao is not None and sessao.get("modelo") != atual:
+                    if sessao.get("modelo"):
+                        app.logger.warning("Aula seguindo em %s no lugar de %s", atual, sessao["modelo"])
+                    sessao["modelo"] = atual
+                return resposta
             except Exception as error:
                 ultimo = error
                 if not _temporario(error):
@@ -227,7 +267,7 @@ def gerar(client, modelo, contents, config, tarefa):
     raise ServiceError(f"Falha ao {tarefa}, mesmo trocando de modelo: {ultimo}")
 
 
-def _transcrever_bloco(client, caminho, model, anterior, parte, total):
+def _transcrever_bloco(client, caminho, model, anterior, parte, total, sessao=None):
     uploaded = client.files.upload(file=caminho)
     try:
         instrucao = "Transcreva esta aula segundo as instruções do sistema."
@@ -242,7 +282,7 @@ def _transcrever_bloco(client, caminho, model, anterior, parte, total):
         generated = gerar(
             client, model, [uploaded, instrucao],
             _generation_config(system_instruction=load_system_prompt("TRANSCRIPT_PROMPT_FILE", "prompt_transcricao.md")),
-            "transcrever o áudio",
+            "transcrever o áudio", sessao,
         )
     finally:
         try:
@@ -251,30 +291,57 @@ def _transcrever_bloco(client, caminho, model, anterior, parte, total):
             pass
 
     if _hit_output_limit(generated):
-        raise ServiceError(
-            "A transcrição foi cortada no limite de saída mesmo em blocos. "
-            "Reduza AUDIO_BLOCO_MINUTOS ou aumente GEMINI_MAX_OUTPUT_TOKENS."
-        )
+        return None  # veio cortada; quem chamou parte o bloco no meio
     return (generated.text or "").strip()
 
 
-def transcribe(client, caminho, model):
-    """Etapa 1: transcrição, em blocos quando a aula é longa."""
+AUDIO_BLOCO_MINIMO = 5  # minutos; abaixo disso, dividir mais não resolve
+
+
+def transcribe(client, caminho, model, sessao=None):
+    """Etapa 1: transcrição, em blocos quando a aula é longa.
+
+    Se um bloco ainda assim volta cortado no teto de saída (professor que fala
+    rápido, aula densa), ele é partido no meio e refeito, em vez de derrubar a
+    aula inteira.
+    """
     minutos = int(os.getenv("AUDIO_BLOCO_MINUTOS", "40"))
     blocos = audio.dividir(caminho, minutos * 60)
+    duracoes = [minutos] * len(blocos)
     if len(blocos) > 1:
         app.logger.info("Áudio dividido em %s blocos de até %s min", len(blocos), minutos)
 
-    partes = []
+    partes, criados, indice = [], [b for b in blocos if b != caminho], 0
     try:
-        for indice, bloco in enumerate(blocos, start=1):
-            texto = _transcrever_bloco(client, bloco, model, "\n\n".join(partes), indice, len(blocos))
+        while indice < len(blocos):
+            bloco, duracao = blocos[indice], duracoes[indice]
+            texto = _transcrever_bloco(
+                client, bloco, model, "\n\n".join(partes), indice + 1, len(blocos), sessao
+            )
+            if texto is None:
+                if duracao <= AUDIO_BLOCO_MINIMO:
+                    raise ServiceError(
+                        "A transcrição foi cortada no limite de saída mesmo em blocos curtos. "
+                        "Reduza AUDIO_BLOCO_MINUTOS ou aumente GEMINI_MAX_OUTPUT_TOKENS."
+                    )
+                metade = max(AUDIO_BLOCO_MINIMO, duracao // 2)
+                menores = audio.dividir(bloco, metade * 60, destino=Path(bloco).parent)
+                if len(menores) <= 1:
+                    raise ServiceError(
+                        "A transcrição foi cortada no limite de saída e o bloco não pôde "
+                        "ser dividido. Reduza AUDIO_BLOCO_MINUTOS."
+                    )
+                app.logger.warning("Bloco %s veio cortado; dividindo em %s", indice + 1, len(menores))
+                criados += menores
+                blocos[indice:indice + 1] = menores
+                duracoes[indice:indice + 1] = [metade] * len(menores)
+                continue
             if texto:
                 partes.append(texto)
+            indice += 1
     finally:
-        for bloco in blocos:
-            if bloco != caminho:
-                Path(bloco).unlink(missing_ok=True)
+        for bloco in criados:
+            Path(bloco).unlink(missing_ok=True)
 
     transcript = "\n\n".join(partes).strip()
     if not transcript:
@@ -282,16 +349,63 @@ def transcribe(client, caminho, model):
     return transcript
 
 
-def build_study(client, transcript, model):
-    """Etapa 2: material de estudo a partir do texto — sem áudio, muito mais barato."""
-    prompt = f"""TRANSCRIÇÃO DA AULA:
-{transcript}
+# Uma aula de ~2 h vira uma transcrição que não cabe num material de estudo só:
+# a Gemini corta a resposta no teto de saída e o resumo simplesmente não sai.
+# A partir deste tamanho o texto é estudado em partes e depois costurado.
+ESTUDO_BLOCO_CARACTERES = 60000  # com teto de saída alto, cabe mais por requisição
+ESTUDO_BLOCO_MINIMO = 6000  # abaixo disso, dividir mais não resolve
+
+
+def _limite_do_bloco():
+    valor = os.getenv("ESTUDO_BLOCO_CARACTERES", "").strip()
+    return int(valor) if valor.isdigit() and int(valor) > 0 else ESTUDO_BLOCO_CARACTERES
+
+
+def _partir_texto(texto, pedacos):
+    """Divide em N partes de tamanho parecido, quebrando entre parágrafos."""
+    if pedacos <= 1:
+        return [texto]
+    alvo = len(texto) / pedacos
+    partes, atual = [], []
+    for paragrafo in texto.split("\n\n"):
+        atual.append(paragrafo)
+        if len(partes) < pedacos - 1 and sum(len(item) + 2 for item in atual) >= alvo:
+            partes.append("\n\n".join(atual))
+            atual = []
+    if atual:
+        partes.append("\n\n".join(atual))
+    return partes or [texto]
+
+
+def _json_gerado(generated):
+    """JSON da resposta, ou None se ela voltou cortada ou inválida."""
+    if _hit_output_limit(generated):
+        return None
+    try:
+        return json.loads(generated.text or "")
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _estudar_trecho(client, trecho, model, rotulo, sessao=None):
+    """Material de estudo de um trecho. Se a resposta vier cortada, parte no meio.
+
+    Devolve uma lista porque um trecho teimoso vira dois — o chamador só junta.
+    """
+    contexto = ""
+    if rotulo:
+        contexto = (
+            f"Este é o trecho {rotulo} da MESMA aula, em sequência.\n"
+            "Trabalhe só o conteúdo deste trecho: não recapitule o que veio antes, não\n"
+            "escreva introdução nem conclusão da aula inteira e não invente o que ainda\n"
+            "não foi dito. Não escreva o cabeçalho `# Tema da aula` nem a linha de\n"
+            "metadados: comece direto nas seções `##`.\n\n"
+        )
+    prompt = f"""{contexto}TRANSCRIÇÃO DA AULA:
+{trecho}
 
 Retorne APENAS JSON válido com estas chaves:
-{{"resumo": "string",
- "acoes": ["string"],
- "estudo": "string em Markdown",
- "slides": [{{"titulo": "string", "topicos": ["string"], "nota": "string"}}]}}
+{{"resumo": "string", "acoes": ["string"], "estudo": "string em Markdown"}}
 Siga as instruções do sistema para o conteúdo de cada campo."""
     generated = gerar(
         client, model, prompt,
@@ -299,23 +413,108 @@ Siga as instruções do sistema para o conteúdo de cada campo."""
             system_instruction=load_system_prompt(),
             response_mime_type="application/json",
         ),
-        "gerar o material de estudo",
+        "gerar o material de estudo", sessao,
     )
 
-    if _hit_output_limit(generated):
+    dados = _json_gerado(generated)
+    if dados is not None:
+        return [dados]
+    if len(trecho) <= ESTUDO_BLOCO_MINIMO:
         raise ServiceError(
-            "O material de estudo foi cortado no limite de saída. "
-            "Aumente GEMINI_MAX_OUTPUT_TOKENS ou peça um resumo mais enxuto em prompt.md."
+            "O material de estudo foi cortado no limite de saída mesmo em trechos curtos. "
+            "Reduza ESTUDO_BLOCO_CARACTERES ou peça um resumo mais enxuto em prompt.md."
         )
-    try:
-        return json.loads(generated.text)
-    except json.JSONDecodeError as error:
-        raise ServiceError("Gemini não retornou o JSON esperado. Tente novamente.") from error
+
+    app.logger.warning("Trecho %s estourou a saída; dividindo em dois", rotulo or "único")
+    metades = _partir_texto(trecho, 2)
+    resultado = []
+    for indice, metade in enumerate(metades, start=1):
+        resultado += _estudar_trecho(client, metade, model, f"{rotulo or 'único'}.{indice}", sessao)
+    return resultado
+
+
+def _juntar_estudo(partes):
+    blocos = [str(parte.get("estudo") or "").strip() for parte in partes]
+    return "\n\n---\n\n".join(bloco for bloco in blocos if bloco)
+
+
+def _juntar_acoes(partes):
+    acoes, vistos = [], set()
+    for parte in partes:
+        for acao in parte.get("acoes") or []:
+            texto = str(acao).strip()
+            if texto and texto.lower() not in vistos:
+                vistos.add(texto.lower())
+                acoes.append(texto)
+    return acoes
+
+
+def _fechar_material(client, estudo, model, sessao=None):
+    """Resumo e slides da aula inteira, a partir do estudo já pronto.
+
+    Entra texto grande, sai texto pequeno — é a única chamada que enxerga a aula
+    toda sem risco de estourar a saída.
+    """
+    prompt = f"""MATERIAL DE ESTUDO JÁ PRONTO DESTA AULA:
+{estudo}
+
+Retorne APENAS JSON válido com estas chaves:
+{{"resumo": "string",
+ "slides": [{{"titulo": "string", "topicos": ["string"], "nota": "string"}}]}}
+O `resumo` cobre a aula inteira, não um trecho. Os `slides` seguem as instruções
+do sistema e cobrem a aula inteira, na ordem do material acima."""
+    generated = gerar(
+        client, model, prompt,
+        _generation_config(
+            system_instruction=load_system_prompt(),
+            response_mime_type="application/json",
+        ),
+        "montar o resumo e os slides", sessao,
+    )
+    return _json_gerado(generated) or {}
+
+
+def build_study(client, transcript, model, sessao=None):
+    """Etapa 2: material de estudo a partir do texto — sem áudio, muito mais barato."""
+    limite = _limite_do_bloco()
+    pedacos = max(1, -(-len(transcript) // limite))
+    trechos = _partir_texto(transcript, pedacos)
+    if len(trechos) > 1:
+        app.logger.info("Transcrição de %s caracteres estudada em %s trechos", len(transcript), len(trechos))
+
+    partes = []
+    for indice, trecho in enumerate(trechos, start=1):
+        rotulo = f"{indice} de {len(trechos)}" if len(trechos) > 1 else ""
+        partes += _estudar_trecho(client, trecho, model, rotulo, sessao)
+
+    estudo = _juntar_estudo(partes)
+    acoes = _juntar_acoes(partes)
+    if len(partes) == 1:
+        parte = partes[0]
+        fechamento = parte if parte.get("slides") else _fechar_material(client, estudo, model, sessao)
+    else:
+        fechamento = _fechar_material(client, estudo, model, sessao)
+
+    resumo = str(fechamento.get("resumo") or "").strip()
+    if not resumo:
+        # O fechamento falhou: os resumos dos trechos, em sequência, servem.
+        resumo = " ".join(str(parte.get("resumo") or "").strip() for parte in partes).strip()
+    if not estudo and not resumo:
+        raise ServiceError("Gemini não retornou o material de estudo. Tente novamente.")
+
+    return {
+        "resumo": resumo,
+        "acoes": acoes,
+        "estudo": estudo,
+        "slides": fechamento.get("slides") or [],
+    }
 
 
 def process_audio(file_info, model):
     """Duas requisições: transcrever o áudio, depois estudar o texto."""
     client = gemini_client()
+    # Um modelo por aula: quem transcreveu é quem estuda, mesmo se houve troca.
+    sessao = {}
 
     audio_url = file_info.get("presigned_url")
     if not audio_url:
@@ -334,12 +533,12 @@ def process_audio(file_info, model):
             temp_file.write(response.content)
             temp_path = temp_file.name
         # O upload agora acontece por bloco, dentro de transcribe.
-        transcript = transcribe(client, temp_path, model)
+        transcript = transcribe(client, temp_path, model, sessao)
     finally:
         if temp_path:
             Path(temp_path).unlink(missing_ok=True)
 
-    return {"transcricao": transcript, **build_study(client, transcript, model)}
+    return {"transcricao": transcript, **build_study(client, transcript, model, sessao)}
 
 
 MAX_HISTORY_TURNS = 12
@@ -364,7 +563,7 @@ def answer_question(transcript, question, history, model):
         generated = client.models.generate_content(
             model=model,
             contents=contents,
-            config=_generation_config(system_instruction=system_prompt),
+            config=_com_saida(_generation_config(system_instruction=system_prompt), model),
         )
     except Exception as error:
         raise ServiceError(f"Falha ao consultar a Gemini: {error}") from error
