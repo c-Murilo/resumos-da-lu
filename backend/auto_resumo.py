@@ -68,14 +68,17 @@ def _processar(app, modulo, gravacao):
     modelo = modulo.resolve_model(None)
     info = modulo.extract_file_payload(modulo.plaud_call("get_file", {"file_id": recording_id}))
     resultado = modulo.process_audio(info, modelo)
+    try:
+        escolhido = storage.listar_nomes().get(recording_id)
+    except storage.StorageError:
+        escolhido = None
     storage.salvar_resumo(recording_id, {
-        "nome": info.get("name"),
+        "nome": escolhido or info.get("name"),
         "modelo": modelo,
         "gravado_em": info.get("start_at"),
         "duracao_ms": info.get("duration"),
         "transcricao": resultado.get("transcricao"),
         "resumo": resultado.get("resumo"),
-        "pontos_principais": resultado.get("pontos_principais") or [],
         "acoes": resultado.get("acoes") or [],
         "estudo": resultado.get("estudo"),
         "slides": resultado.get("slides") or [],

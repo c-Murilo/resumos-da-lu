@@ -71,8 +71,13 @@ Ordem que funciona:
 
 ## Resumo automático
 
-Com `AUTO_RESUMO=1`, uma thread varre a Plaud a cada `AUTO_RESUMO_INTERVALO`
-segundos (300 por padrão) e resume sozinha o que for **novo**.
+Ligado por padrão (`AUTO_RESUMO=1`): uma thread varre a Plaud a cada
+`AUTO_RESUMO_INTERVALO` segundos (30) e resume sozinha o que for **novo**, para
+que a aula esteja pronta quando ela abrir o app. A lista no navegador também se
+atualiza a cada 30 s, e sempre que o app volta ao primeiro plano.
+
+Uma varredura que não encontra nada novo custa só uma chamada de listagem à
+Plaud; o gasto com a Gemini acontece uma vez por gravação.
 
 "Novo" é o que foi criado depois do marco gravado em `config.auto_resumo_marco`,
 fixado na primeira varredura. Ou seja: ligar o recurso não dispara o acervo
@@ -112,9 +117,27 @@ chaves. Os prompts dizem **o que** vai em cada uma:
 | --- | --- | --- |
 | `transcricao` | transcrição integral, com termos médicos corrigidos | "Ver transcrição completa" |
 | `resumo` | visão geral em até 5 linhas | bloco destacado no topo |
-| `pontos_principais` | pontos de alta relevância para prova | coluna "Cai na prova" |
 | `acoes` | recados administrativos, provas, prazos | coluna "Recados e prazos" |
 | `estudo` | material de estudo completo em Markdown | seção "Material de estudo" |
+
+O que "cai na prova" não é mais gerado: o modelo não tem como saber, e um
+palpite dele viraria prioridade de estudo errada. Quando o professor diz em aula
+que algo é importante, isso aparece dentro do conteúdo, com a atribuição.
+
+## Nome e anotações à mão
+
+`PATCH /api/recordings/<id>/resumo` aceita `nome` e `anotacoes`. O nome pode ser
+trocado pelo lápis no cartão da lista ou no título do resumo aberto, e vale
+mesmo para gravação ainda não resumida: fica na coleção `nomes`, aplicada por
+cima do título que a Plaud devolve (que costuma ser a data). Quando a aula é
+resumida depois, o nome escolhido é mantido. As anotações são os traços da caneta feitos
+na folha embaixo do material de estudo, guardados como coordenadas em fração da
+largura/altura — assim o desenho volta certo em qualquer tamanho de tela e sai
+no PDF. Ambos exigem MongoDB configurado.
+
+`DELETE /api/recordings/<id>/resumo` tira o resumo da biblioteca, junto com as
+anotações e o histórico de perguntas. A gravação na Plaud não é tocada: ela volta
+a aparecer como "resumir".
 
 ## Perguntas sobre a gravação
 

@@ -7,6 +7,7 @@ Coleções:
 - resumos    — uma por gravação, chaveada por recording_id
 - perguntas  — histórico do chat, ligado pelo recording_id
 - config     — ajustes internos e o token da Plaud, chaveados por _id
+- nomes      — títulos escolhidos à mão, inclusive de gravação ainda sem resumo
 """
 
 import os
@@ -82,6 +83,56 @@ def salvar_resumo(recording_id, dados):
     except Exception as error:
         raise StorageError(f"MongoDB: {error}") from error
     return {"id": recording_id}
+
+
+def atualizar_resumo(recording_id, campos):
+    """Edições feitas à mão (nome, anotações). Devolve False se não houver resumo."""
+    try:
+        resultado = _db().resumos.update_one(
+            {"recording_id": recording_id},
+            {"$set": {**campos, "atualizado_em": _agora()}},
+        )
+    except StorageError:
+        raise
+    except Exception as error:
+        raise StorageError(f"MongoDB: {error}") from error
+    return resultado.matched_count > 0
+
+
+def salvar_nome(recording_id, nome):
+    """Título dado pela usuária. Vale mesmo antes de a aula ser resumida."""
+    try:
+        _db().nomes.update_one(
+            {"_id": recording_id},
+            {"$set": {"nome": nome, "atualizado_em": _agora()}},
+            upsert=True,
+        )
+    except StorageError:
+        raise
+    except Exception as error:
+        raise StorageError(f"MongoDB: {error}") from error
+
+
+def listar_nomes():
+    """Mapa recording_id -> nome, para renomear a lista que vem da Plaud."""
+    try:
+        return {item["_id"]: item["nome"] for item in _db().nomes.find({})}
+    except StorageError:
+        raise
+    except Exception as error:
+        raise StorageError(f"MongoDB: {error}") from error
+
+
+def apagar_resumo(recording_id):
+    """Apaga o resumo e o histórico de perguntas dele. False se não existia."""
+    try:
+        resultado = _db().resumos.delete_one({"recording_id": recording_id})
+        _db().perguntas.delete_many({"recording_id": recording_id})
+    except StorageError:
+        raise
+    except Exception as error:
+        raise StorageError(f"MongoDB: {error}") from error
+    return resultado.deleted_count > 0
 
 
 def buscar_resumo(recording_id):

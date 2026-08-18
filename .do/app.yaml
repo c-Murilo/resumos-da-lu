@@ -39,13 +39,13 @@ services:
         type: SECRET
         value: COLE_NO_PAINEL
 
-      # Resumo automático das gravações novas, varrendo a cada 5 minutos.
+      # Resumo automático das gravações novas, varrendo a cada 30 segundos.
       - key: AUTO_RESUMO
         scope: RUN_TIME
         value: "1"
       - key: AUTO_RESUMO_INTERVALO
         scope: RUN_TIME
-        value: "300"
+        value: "30"
 
       # Front e API no mesmo domínio: CORS não entra em jogo.
       - key: FRONTEND_ORIGIN

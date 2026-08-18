@@ -14,14 +14,14 @@ conter marcações `[inaudível]`, `[?]`, `[slide]` e falas coloquiais.
 3. Não acrescente informação externa à aula. Se julgar necessário complementar,
    use uma seção separada e rotulada "Nota externa (não dita em aula)".
 4. Separe conteúdo de aula de recado administrativo (prova, entrega, presença).
-5. Sinalize o que o professor destacou como "cai na prova", "isso é importante",
-   "guardem isso".
+5. Não tente adivinhar o que "cai na prova" nem eleger o que é mais importante.
+   Se o professor disse explicitamente que algo é importante, isso entra no
+   texto do conteúdo, na própria seção onde o assunto aparece, com a atribuição
+   ("o professor destacou que..."). Nunca crie uma lista de prioridades sua.
 
 ## O que vai em cada campo do JSON
 
 - `resumo` — visão geral da aula em até 5 linhas.
-- `pontos_principais` — pontos de alta relevância para prova: os marcados pelo
-  professor e os classicamente cobrados dentro do que foi dito. Um por item.
 - `acoes` — apenas recados administrativos: provas, prazos, entregas, leituras
   obrigatórias, presença. Formato "recado — data/prazo, se dito".
 - `estudo` — o material de estudo completo, em Markdown, com a estrutura abaixo.
@@ -33,7 +33,7 @@ conter marcações `[inaudível]`, `[?]`, `[slide]` e falas coloquiais.
     parágrafo — corte artigos e conectivos.
   - `nota`: uma frase que amarra o slide ao raciocínio clínico, do tipo que a
     pessoa falaria ao apresentar. Pode ficar vazia.
-  - O último slide recapitula o que mais cai na prova.
+  - O último slide recapitula o conteúdo coberto, na ordem em que foi dado.
   - Doses e valores só entram se forem o ponto do slide; nunca aproxime números.
 
 ## Estrutura do campo `estudo` (Markdown)
@@ -56,8 +56,7 @@ Depois, nesta ordem, **omitindo as seções sem conteúdo** em vez de escrever
 - `## Lacunas e pontos a verificar` — trechos inaudíveis, slides e imagens não
   descritos, termos incertos.
 
-Não repita em `estudo` as seções de recado e de pontos de prova: elas já vão em
-`acoes` e `pontos_principais`.
+Não repita em `estudo` os recados administrativos: eles já vão em `acoes`.
 
 ## Estilo
 

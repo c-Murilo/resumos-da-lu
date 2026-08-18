@@ -289,7 +289,6 @@ def build_study(client, transcript, model):
 
 Retorne APENAS JSON válido com estas chaves:
 {{"resumo": "string",
- "pontos_principais": ["string"],
  "acoes": ["string"],
  "estudo": "string em Markdown",
  "slides": [{{"titulo": "string", "topicos": ["string"], "nota": "string"}}]}}
@@ -392,8 +391,24 @@ def list_recordings():
         value = request.args.get(key, "").strip()
         if value.isdigit():
             filters[key] = max(int(value), minimum)
-    payload = plaud_call("list_files", filters)
-    return jsonify(extract_file_payload(payload))
+    arquivos = extract_file_payload(plaud_call("list_files", filters))
+    return jsonify(_com_nomes_escolhidos(arquivos))
+
+
+def _com_nomes_escolhidos(arquivos):
+    """O título da Plaud é a data da gravação; se ela renomeou, vale o dela."""
+    if not storage.enabled() or not isinstance(arquivos, list):
+        return arquivos
+    try:
+        nomes = storage.listar_nomes()
+    except storage.StorageError as error:
+        app.logger.warning("Falha ao ler os nomes escolhidos: %s", error)
+        return arquivos
+    for item in arquivos:
+        escolhido = nomes.get(item.get("id"))
+        if escolhido:
+            item["name"] = escolhido
+    return arquivos
 
 
 @app.get("/api/recordings/<recording_id>/transcript")
@@ -486,6 +501,55 @@ def get_resumo(recording_id):
     return jsonify(saved)
 
 
+@app.patch("/api/recordings/<recording_id>/resumo")
+def editar_resumo(recording_id):
+    """Renomear o resumo e guardar as anotações feitas à mão sobre ele."""
+    if not storage.enabled():
+        return jsonify({"error": "Sem MongoDB configurado: não há onde guardar a edição."}), 503
+
+    body = request.get_json(silent=True) or {}
+    mudancas = {}
+    if "nome" in body:
+        nome = (body.get("nome") or "").strip()
+        if not nome:
+            return jsonify({"error": "O nome não pode ficar vazio."}), 400
+        mudancas["nome"] = nome[:200]
+        # Guardado à parte porque a aula pode nem ter sido resumida ainda.
+        try:
+            storage.salvar_nome(recording_id, mudancas["nome"])
+        except storage.StorageError as error:
+            raise ServiceError(str(error)) from error
+    if "anotacoes" in body:
+        anotacoes = body.get("anotacoes")
+        if not isinstance(anotacoes, list):
+            return jsonify({"error": "Anotações em formato inesperado."}), 400
+        mudancas["anotacoes"] = anotacoes
+    if not mudancas:
+        return jsonify({"error": "Nada para alterar."}), 400
+
+    try:
+        existe = storage.atualizar_resumo(recording_id, mudancas)
+    except storage.StorageError as error:
+        raise ServiceError(str(error)) from error
+    # Só o nome vive fora do resumo; anotação precisa de um resumo para pendurar.
+    if not existe and "anotacoes" in mudancas:
+        return jsonify({"error": "Esta gravação ainda não foi resumida."}), 404
+    return jsonify({"ok": True, **mudancas})
+
+
+@app.delete("/api/recordings/<recording_id>/resumo")
+def apagar_resumo(recording_id):
+    """Tira o resumo da biblioteca. A gravação na Plaud continua intacta."""
+    if not storage.enabled():
+        return jsonify({"error": "Sem MongoDB configurado: não há nada guardado para apagar."}), 503
+    try:
+        if not storage.apagar_resumo(recording_id):
+            return jsonify({"error": "Esta gravação não tem resumo guardado."}), 404
+    except storage.StorageError as error:
+        raise ServiceError(str(error)) from error
+    return jsonify({"ok": True})
+
+
 @app.post("/api/recordings/<recording_id>/process")
 def process_recording(recording_id):
     body = request.get_json(silent=True) or {}
@@ -508,7 +572,6 @@ def process_recording(recording_id):
                 "duracao_ms": info.get("duration"),
                 "transcricao": resultado.get("transcricao"),
                 "resumo": resultado.get("resumo"),
-                "pontos_principais": resultado.get("pontos_principais") or [],
                 "acoes": resultado.get("acoes") or [],
                 "estudo": resultado.get("estudo"),
                 "slides": resultado.get("slides") or [],
@@ -595,7 +658,7 @@ def _ligar_auto_resumo():
 
     import auto_resumo
 
-    auto_resumo.iniciar(app, sys.modules[__name__], int(os.getenv("AUTO_RESUMO_INTERVALO", "300")))
+    auto_resumo.iniciar(app, sys.modules[__name__], int(os.getenv("AUTO_RESUMO_INTERVALO", "30")))
 
 
 _ligar_auto_resumo()
