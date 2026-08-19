@@ -585,6 +585,46 @@ def build_study(client, transcript, model, sessao=None):
 _uma_aula_por_vez = threading.Lock()
 
 
+def _verificar(client, transcript, material, model, sessao):
+    """Confere o material contra a transcrição e devolve o que não se sustenta.
+
+    Custa uma requisição a mais por aula, o que pesa no plano gratuito — daí o
+    VERIFICAR_RESUMO, para desligar quando a cota estiver apertada. Nada é
+    reescrito automaticamente: em conteúdo clínico, apontar o trecho suspeito é
+    mais seguro que trocar uma frase errada por outra igualmente inventada.
+    """
+    if os.getenv("VERIFICAR_RESUMO", "1").strip() in ("0", "false", "nao", "não"):
+        return []
+
+    _anotar(sessao, "Conferindo o resumo contra a transcrição")
+    prompt = f"""TRANSCRIÇÃO DA AULA:
+{transcript}
+
+MATERIAL DE ESTUDO GERADO A PARTIR DELA:
+{json.dumps({k: material.get(k) for k in ("resumo", "acoes", "estudo", "slides")}, ensure_ascii=False)}
+
+Confira o material contra a transcrição segundo as instruções do sistema."""
+    try:
+        generated = gerar(
+            client, model, prompt,
+            _generation_config(
+                system_instruction=load_system_prompt("CHECK_PROMPT_FILE", "prompt_verificacao.md"),
+                response_mime_type="application/json",
+            ),
+            "conferir o material", sessao,
+        )
+    except ServiceError as error:
+        # Sem cota para conferir não é motivo para perder o resumo já pronto.
+        app.logger.warning("Verificação não rodou: %s", error)
+        return []
+
+    dados = _json_gerado(generated) or {}
+    problemas = [item for item in (dados.get("problemas") or []) if isinstance(item, dict)]
+    if problemas:
+        app.logger.info("Verificação apontou %s trecho(s) para conferir", len(problemas))
+    return problemas
+
+
 def process_audio(file_info, model, anotar=None, transcricao=None, ao_transcrever=None):
     """Duas requisições: transcrever o áudio, depois estudar o texto."""
     if not _uma_aula_por_vez.acquire(blocking=False):
@@ -608,7 +648,7 @@ def _process_audio(file_info, model, anotar=None, transcricao=None, ao_transcrev
     if transcricao:
         # Transcrição já paga numa tentativa anterior: nem baixa o áudio de novo.
         _anotar(sessao, "Aproveitando a transcrição já salva")
-        return {"transcricao": transcricao, **build_study(client, transcricao, model, sessao)}
+        return _com_verificacao(client, transcricao, model, sessao)
 
     _anotar(sessao, "Baixando o áudio da Plaud")
     suffix = Path(audio_url.split("?", 1)[0]).suffix or ".audio"
@@ -635,7 +675,16 @@ def _process_audio(file_info, model, anotar=None, transcricao=None, ao_transcrev
         # Guarda antes de estudar: se o material falhar (cota, por exemplo), a
         # próxima tentativa não gasta outra requisição transcrevendo tudo de novo.
         ao_transcrever(transcript)
-    return {"transcricao": transcript, **build_study(client, transcript, model, sessao)}
+    return _com_verificacao(client, transcript, model, sessao)
+
+
+def _com_verificacao(client, transcript, model, sessao):
+    material = build_study(client, transcript, model, sessao)
+    return {
+        "transcricao": transcript,
+        **material,
+        "verificacao": _verificar(client, transcript, material, model, sessao),
+    }
 
 
 MAX_HISTORY_TURNS = 12
@@ -891,6 +940,7 @@ def _resumir_e_guardar(recording_id, model, anotar):
                 "acoes": resultado.get("acoes") or [],
                 "estudo": resultado.get("estudo"),
                 "slides": resultado.get("slides") or [],
+                "verificacao": resultado.get("verificacao") or [],
                 "parcial": False,
             })
         except storage.StorageError as error:

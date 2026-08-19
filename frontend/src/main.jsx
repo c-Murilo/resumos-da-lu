@@ -250,6 +250,34 @@ function NomeDoCartao({ item, onSalvar }) {
   </strong>
 }
 
+// Trechos que a conferência não achou na transcrição. Não corrigimos sozinhos:
+// em conteúdo clínico, apontar o trecho é mais seguro que trocar uma frase
+// errada por outra inventada. Quem estuda decide.
+function Verificacao({ itens }) {
+  if (!itens?.length) return null
+  const altas = itens.filter(item => item.gravidade === 'alta').length
+  return (
+    <details className="conferencia" open={altas > 0}>
+      <summary>
+        <span>conferência · {itens.length} {itens.length === 1 ? 'trecho a checar' : 'trechos a checar'}</span>
+        <span>{altas > 0 ? `${altas} de risco alto` : 'nada grave'}</span>
+      </summary>
+      <ul>
+        {itens.map((item, i) => (
+          <li key={i} className={item.gravidade === 'alta' ? 'grave' : ''}>
+            <b>{item.tipo || 'trecho'}</b>
+            <p className="conferencia-material">“{item.no_material}”</p>
+            <p className="conferencia-aula">{item.na_transcricao
+              ? <>na aula: “{item.na_transcricao}”</>
+              : <>não aparece na transcrição</>}</p>
+            {item.correcao && <p className="conferencia-correcao">sugerido: {item.correcao}</p>}
+          </li>
+        ))}
+      </ul>
+    </details>
+  )
+}
+
 function App() {
   const [recordings, setRecordings] = useState([])
   const [query, setQuery] = useState('')
@@ -528,6 +556,7 @@ function App() {
               </div>
             </div>
             <div className="summary"><p>{result.resumo}</p></div>
+            <Verificacao itens={result.verificacao} />
             {result.acoes?.length > 0 && <div className="insights">
               <div><h3>Recados e prazos</h3><ul className="actions">{result.acoes.map((action, i) => <li key={i}>{action}</li>)}</ul></div>
             </div>}

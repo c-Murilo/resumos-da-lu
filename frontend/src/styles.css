@@ -87,3 +87,19 @@
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;scroll-behavior:auto!important}}
 
 .processing-nota{margin-top:14px;font-size:.78rem;color:#9a93a1;line-height:1.5}
+
+/* Conferência do resumo contra a transcrição. */
+.conferencia{margin:0 0 22px;border:1px solid #e6d9c9;border-top:none;border-radius:12px;background:#fdf8f1;padding:13px 16px}
+.conferencia summary{color:#8a6524}
+.conferencia summary span:last-child{font-weight:400;color:#a8895f}
+.conferencia ul{margin:14px 0 2px;padding:0;list-style:none}
+.conferencia li{padding:0 0 13px 13px;border-left:2px solid #e7cfa8}
+.conferencia li.grave{border-left-color:#c8654b}
+.conferencia li+li{margin-top:13px}
+.conferencia li b{font:700 .68rem/1 'DM Mono',monospace;letter-spacing:.08em;text-transform:uppercase;color:#8a6524}
+.conferencia li.grave b{color:#b3543c}
+.conferencia p{margin:5px 0 0;font-size:.85rem;line-height:1.5}
+.conferencia-material{color:#4c4550}
+.conferencia-aula{color:#7b7381}
+.conferencia-correcao{color:#4a6b58}
+.conferencia li:before{content:none}

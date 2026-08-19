@@ -85,6 +85,7 @@ def _processar(app, modulo, gravacao):
         "acoes": resultado.get("acoes") or [],
         "estudo": resultado.get("estudo"),
         "slides": resultado.get("slides") or [],
+        "verificacao": resultado.get("verificacao") or [],
     })
     return True
 

@@ -61,6 +61,11 @@ services:
       - key: AUDIO_BLOCO_MINUTOS
         scope: RUN_TIME
         value: "120"
+      # Confere o material contra a transcrição antes de entregar. Custa uma
+      # requisição a mais por aula; ponha "0" se a cota do dia estiver apertada.
+      - key: VERIFICAR_RESUMO
+        scope: RUN_TIME
+        value: "1"
 
       # Resumo automático das gravações novas, varrendo a cada 30 segundos.
       - key: AUTO_RESUMO
