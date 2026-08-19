@@ -64,6 +64,9 @@ def _processar(app, modulo, gravacao):
     recording_id = gravacao["id"]
     if storage.buscar_resumo(recording_id):
         return True
+    if modulo.trabalhos.rodando(recording_id):
+        # Alguém clicou em resumir esta agora; deixa a thread dela terminar.
+        return True
 
     modelo = modulo.resolve_model(None)
     info = modulo.extract_file_payload(modulo.plaud_call("get_file", {"file_id": recording_id}))

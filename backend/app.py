@@ -5,6 +5,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from werkzeug.exceptions import HTTPException
 import audio
 import plaud_token
 import storage
+import trabalhos
 
 load_dotenv()
 
@@ -181,6 +183,14 @@ def resolve_model(requested):
     return requested
 
 
+def _anotar(sessao, texto):
+    """Etapa atual: vai para o log e para quem estiver acompanhando por /status."""
+    app.logger.info("%s", texto)
+    registrar = (sessao or {}).get("anotar")
+    if callable(registrar):
+        registrar(texto)
+
+
 def _hit_output_limit(generated):
     """Transcrição + material de estudo numa resposta só pode estourar o teto de saída."""
     for candidate in getattr(generated, "candidates", None) or []:
@@ -219,6 +229,38 @@ def _com_saida(config, modelo):
 TENTATIVAS_POR_MODELO = 3
 ESPERA_ENTRE_TENTATIVAS = 4  # segundos, dobrando a cada falha
 ERROS_TEMPORARIOS = ("503", "429", "500", "504", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded")
+MARCAS_COTA_DIARIA = ("perday", "per day", "requests per day", "rpd")
+
+# No plano gratuito o gargalo é requisição por minuto (5 na maioria dos flash) e
+# por dia. Uma aula longa dispara várias chamadas seguidas, então elas saem
+# espaçadas em vez de tomarem 429 em série.
+_ultima_chamada = {}
+_ritmo = threading.Lock()
+
+
+def _aguardar_vez(modelo):
+    """Espaça as chamadas de um mesmo modelo para caber no limite por minuto."""
+    rpm = os.getenv("GEMINI_RPM", "5").strip()
+    intervalo = 60.0 / (int(rpm) if rpm.isdigit() and int(rpm) > 0 else 5)
+    with _ritmo:  # o limite é da chave inteira, não desta thread
+        falta = _ultima_chamada.get(modelo, 0.0) + intervalo - time.monotonic()
+        if falta > 0:
+            time.sleep(falta)
+        _ultima_chamada[modelo] = time.monotonic()
+
+
+def _cota_diaria(error):
+    """429 de cota do dia: insistir no mesmo modelo não adianta, só queima tempo."""
+    texto = str(error).lower()
+    if "429" not in texto and "resource_exhausted" not in texto:
+        return False
+    return any(marca in texto for marca in MARCAS_COTA_DIARIA)
+
+
+def _espera_pedida(error):
+    """A própria Gemini diz quanto esperar em retryDelay; melhor que chutar."""
+    achado = re.search(r"retry.?delay[\'\"]?[:=]\s*[\'\"]?(\d+)", str(error), re.IGNORECASE)
+    return min(int(achado.group(1)), 60) if achado else 0
 
 
 def _cadeia_de_modelos(preferido, sessao=None):
@@ -241,10 +283,11 @@ def _temporario(error):
 
 def gerar(client, modelo, contents, config, tarefa, sessao=None):
     """Tenta 3 vezes no modelo pedido e, se ele estiver fora, cai para o reserva."""
-    ultimo = None
+    ultimo, sem_cota = None, []
     for atual in _cadeia_de_modelos(modelo, sessao):
         for tentativa in range(1, TENTATIVAS_POR_MODELO + 1):
             try:
+                _aguardar_vez(atual)
                 resposta = client.models.generate_content(
                     model=atual, contents=contents, config=_com_saida(config, atual)
                 )
@@ -257,13 +300,25 @@ def gerar(client, modelo, contents, config, tarefa, sessao=None):
                 ultimo = error
                 if not _temporario(error):
                     raise ServiceError(f"Falha ao {tarefa}: {error}") from error
+                if _cota_diaria(error):
+                    # Cota do dia estourada: esperar não devolve requisição nenhuma.
+                    app.logger.warning("%s: cota diária de %s no fim, indo para o próximo", tarefa, atual)
+                    sem_cota.append(atual)
+                    break
                 app.logger.warning(
                     "%s: %s falhou (tentativa %s/%s): %s",
                     tarefa, atual, tentativa, TENTATIVAS_POR_MODELO, str(error)[:120],
                 )
                 if tentativa < TENTATIVAS_POR_MODELO:
-                    time.sleep(ESPERA_ENTRE_TENTATIVAS * tentativa)
-        app.logger.warning("%s: desistindo de %s, tentando o próximo modelo", tarefa, atual)
+                    time.sleep(_espera_pedida(error) or ESPERA_ENTRE_TENTATIVAS * tentativa)
+        else:
+            app.logger.warning("%s: desistindo de %s, tentando o próximo modelo", tarefa, atual)
+    if sem_cota:
+        raise ServiceError(
+            "A cota gratuita de hoje acabou em " + ", ".join(sem_cota) +
+            ". O plano gratuito dá poucas requisições por dia em cada modelo, e uma aula "
+            "longa gasta várias. Tente amanhã, escolha outro modelo ou use uma chave paga."
+        )
     raise ServiceError(f"Falha ao {tarefa}, mesmo trocando de modelo: {ultimo}")
 
 
@@ -315,6 +370,10 @@ def transcribe(client, caminho, model, sessao=None):
     try:
         while indice < len(blocos):
             bloco, duracao = blocos[indice], duracoes[indice]
+            if len(blocos) > 1:
+                _anotar(sessao, f"Transcrevendo o bloco {indice + 1} de {len(blocos)}")
+            else:
+                _anotar(sessao, "Transcrevendo a aula")
             texto = _transcrever_bloco(
                 client, bloco, model, "\n\n".join(partes), indice + 1, len(blocos), sessao
             )
@@ -352,7 +411,11 @@ def transcribe(client, caminho, model, sessao=None):
 # Uma aula de ~2 h vira uma transcrição que não cabe num material de estudo só:
 # a Gemini corta a resposta no teto de saída e o resumo simplesmente não sai.
 # A partir deste tamanho o texto é estudado em partes e depois costurado.
-ESTUDO_BLOCO_CARACTERES = 60000  # com teto de saída alto, cabe mais por requisição
+# Cada trecho é uma requisição, e no plano gratuito requisição é o recurso caro.
+# Então o padrão é grande de propósito: a aula inteira numa chamada só. Se a
+# resposta vier cortada, _estudar_trecho parte no meio e refaz — o custo extra
+# só aparece quando realmente precisa.
+ESTUDO_BLOCO_CARACTERES = 200000
 ESTUDO_BLOCO_MINIMO = 6000  # abaixo disso, dividir mais não resolve
 
 
@@ -392,6 +455,11 @@ def _estudar_trecho(client, trecho, model, rotulo, sessao=None):
 
     Devolve uma lista porque um trecho teimoso vira dois — o chamador só junta.
     """
+    unico = not rotulo
+    campos = ('{"resumo": "string", "acoes": ["string"], "estudo": "string em Markdown",\n'
+              ' "slides": [{"titulo": "string", "topicos": ["string"], "nota": "string"}]}'
+              if unico else
+              '{"resumo": "string", "acoes": ["string"], "estudo": "string em Markdown"}')
     contexto = ""
     if rotulo:
         contexto = (
@@ -405,7 +473,7 @@ def _estudar_trecho(client, trecho, model, rotulo, sessao=None):
 {trecho}
 
 Retorne APENAS JSON válido com estas chaves:
-{{"resumo": "string", "acoes": ["string"], "estudo": "string em Markdown"}}
+{campos}
 Siga as instruções do sistema para o conteúdo de cada campo."""
     generated = gerar(
         client, model, prompt,
@@ -455,6 +523,7 @@ def _fechar_material(client, estudo, model, sessao=None):
     Entra texto grande, sai texto pequeno — é a única chamada que enxerga a aula
     toda sem risco de estourar a saída.
     """
+    _anotar(sessao, "Montando o resumo e os slides")
     prompt = f"""MATERIAL DE ESTUDO JÁ PRONTO DESTA AULA:
 {estudo}
 
@@ -485,6 +554,7 @@ def build_study(client, transcript, model, sessao=None):
     partes = []
     for indice, trecho in enumerate(trechos, start=1):
         rotulo = f"{indice} de {len(trechos)}" if len(trechos) > 1 else ""
+        _anotar(sessao, f"Escrevendo o material de estudo{f' ({rotulo})' if rotulo else ''}")
         partes += _estudar_trecho(client, trecho, model, rotulo, sessao)
 
     estudo = _juntar_estudo(partes)
@@ -510,34 +580,61 @@ def build_study(client, transcript, model, sessao=None):
     }
 
 
-def process_audio(file_info, model):
+# Uma aula por vez no processo inteiro. Duas em paralelo (botão + auto-resumo)
+# dobrariam o pico de memória e ainda brigariam pelo limite por minuto da Gemini.
+_uma_aula_por_vez = threading.Lock()
+
+
+def process_audio(file_info, model, anotar=None, transcricao=None, ao_transcrever=None):
     """Duas requisições: transcrever o áudio, depois estudar o texto."""
+    if not _uma_aula_por_vez.acquire(blocking=False):
+        _anotar({"anotar": anotar}, "Esperando a aula anterior terminar")
+        _uma_aula_por_vez.acquire()
+    try:
+        return _process_audio(file_info, model, anotar, transcricao, ao_transcrever)
+    finally:
+        _uma_aula_por_vez.release()
+
+
+def _process_audio(file_info, model, anotar=None, transcricao=None, ao_transcrever=None):
     client = gemini_client()
     # Um modelo por aula: quem transcreveu é quem estuda, mesmo se houve troca.
-    sessao = {}
+    sessao = {"anotar": anotar}
 
     audio_url = file_info.get("presigned_url")
     if not audio_url:
         raise ServiceError("A Plaud não forneceu uma URL temporária para este áudio.")
 
-    try:
-        response = requests.get(audio_url, timeout=180)
-        response.raise_for_status()
-    except requests.RequestException as error:
-        raise ServiceError(f"Falha ao baixar o áudio temporário da Plaud: {error}") from error
+    if transcricao:
+        # Transcrição já paga numa tentativa anterior: nem baixa o áudio de novo.
+        _anotar(sessao, "Aproveitando a transcrição já salva")
+        return {"transcricao": transcricao, **build_study(client, transcricao, model, sessao)}
 
+    _anotar(sessao, "Baixando o áudio da Plaud")
     suffix = Path(audio_url.split("?", 1)[0]).suffix or ".audio"
     temp_path = None
     try:
+        # Em pedaços e direto para o disco: uma aula de duas horas passa de 100 MB,
+        # e response.content guardaria tudo isso na RAM de uma vez.
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-            temp_file.write(response.content)
             temp_path = temp_file.name
+            try:
+                with requests.get(audio_url, timeout=180, stream=True) as response:
+                    response.raise_for_status()
+                    for pedaco in response.iter_content(1024 * 1024):
+                        temp_file.write(pedaco)
+            except requests.RequestException as error:
+                raise ServiceError(f"Falha ao baixar o áudio temporário da Plaud: {error}") from error
         # O upload agora acontece por bloco, dentro de transcribe.
         transcript = transcribe(client, temp_path, model, sessao)
     finally:
         if temp_path:
             Path(temp_path).unlink(missing_ok=True)
 
+    if callable(ao_transcrever):
+        # Guarda antes de estudar: se o material falhar (cota, por exemplo), a
+        # próxima tentativa não gasta outra requisição transcrevendo tudo de novo.
+        ao_transcrever(transcript)
     return {"transcricao": transcript, **build_study(client, transcript, model, sessao)}
 
 
@@ -629,8 +726,8 @@ def _resumo_salvo(recording_id):
     except storage.StorageError as error:
         app.logger.warning("Falha ao ler do MongoDB: %s", error)
         return None
-    if not saved:
-        return None
+    if not saved or saved.get("parcial"):
+        return None  # só a transcrição guardada; ainda não há material para abrir
     try:
         saved["historico"] = storage.listar_perguntas(recording_id)
     except storage.StorageError:
@@ -749,22 +846,42 @@ def apagar_resumo(recording_id):
     return jsonify({"ok": True})
 
 
-@app.post("/api/recordings/<recording_id>/process")
-def process_recording(recording_id):
-    body = request.get_json(silent=True) or {}
-    model = resolve_model(body.get("modelo"))
+def _transcricao_guardada(recording_id):
+    """Transcrição de uma tentativa anterior que não chegou ao fim."""
+    if not storage.enabled():
+        return None
+    try:
+        salvo = storage.buscar_resumo(recording_id) or {}
+    except storage.StorageError:
+        return None
+    return (salvo.get("transcricao") or "").strip() or None
 
-    if not body.get("forcar"):
-        saved = _resumo_salvo(recording_id)
-        if saved:
-            return jsonify(saved)
 
+def _resumir_e_guardar(recording_id, model, anotar):
+    """O trabalho pesado de uma aula, do jeito que a thread de fundo executa."""
     info = extract_file_payload(plaud_call("get_file", {"file_id": recording_id}))
-    resultado = {**process_audio(info, model), "modelo": model}
+
+    def guardar_transcricao(texto):
+        if not storage.enabled():
+            return
+        try:
+            storage.salvar_resumo(recording_id, {
+                "nome": info.get("name"), "modelo": model,
+                "gravado_em": info.get("start_at"), "duracao_ms": info.get("duration"),
+                "transcricao": texto, "parcial": True,
+            })
+        except storage.StorageError as error:
+            app.logger.warning("Falha ao guardar a transcrição: %s", error)
+
+    resultado = {**process_audio(
+        info, model, anotar,
+        transcricao=_transcricao_guardada(recording_id),
+        ao_transcrever=guardar_transcricao,
+    ), "modelo": model}
 
     if storage.enabled():
         try:
-            linha = storage.salvar_resumo(recording_id, {
+            storage.salvar_resumo(recording_id, {
                 "nome": info.get("name"),
                 "modelo": model,
                 "gravado_em": info.get("start_at"),
@@ -774,15 +891,55 @@ def process_recording(recording_id):
                 "acoes": resultado.get("acoes") or [],
                 "estudo": resultado.get("estudo"),
                 "slides": resultado.get("slides") or [],
+                "parcial": False,
             })
-            if linha:
-                resultado["id"] = linha["id"]
         except storage.StorageError as error:
             # Perder o histórico é ruim, mas não justifica descartar o resumo pronto.
             app.logger.warning("Falha ao salvar no MongoDB: %s", error)
+    return resultado
 
-    resultado["historico"] = []
-    return jsonify(resultado)
+
+def _situacao(trabalho):
+    return {"estado": trabalho["estado"], "etapa": trabalho["etapa"], "erro": trabalho["erro"]}
+
+
+@app.post("/api/recordings/<recording_id>/process")
+def process_recording(recording_id):
+    """Não resume aqui: dispara o trabalho e responde na hora.
+
+    Uma aula longa leva minutos, e o proxy da hospedagem corta a conexão bem
+    antes disso. Quem chamou acompanha por /status e busca o material em
+    /resumo quando ficar pronto.
+    """
+    body = request.get_json(silent=True) or {}
+    model = resolve_model(body.get("modelo"))
+
+    if not body.get("forcar"):
+        saved = _resumo_salvo(recording_id)
+        if saved:
+            return jsonify(saved)
+
+    if not storage.enabled():
+        # Sem banco, o resultado só existe nesta resposta: não dá para soltar.
+        return jsonify({**_resumir_e_guardar(recording_id, model, None), "historico": []})
+
+    trabalho = trabalhos.iniciar(
+        app, recording_id,
+        lambda anotar: _resumir_e_guardar(recording_id, model, anotar),
+    )
+    return jsonify(_situacao(trabalho)), 202
+
+
+@app.get("/api/recordings/<recording_id>/status")
+def status_recording(recording_id):
+    """Andamento de um resumo em curso, para o front mostrar em que pé está."""
+    trabalho = trabalhos.estado(recording_id)
+    if trabalho:
+        return jsonify(_situacao(trabalho))
+    # Sem trabalho na memória: ou já terminou faz tempo, ou o servidor reiniciou.
+    if _resumo_salvo(recording_id):
+        return jsonify({"estado": "pronto", "etapa": "Pronto", "erro": None})
+    return jsonify({"estado": "parado", "etapa": None, "erro": None})
 
 
 @app.post("/api/recordings/<recording_id>/ask")

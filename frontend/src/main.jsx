@@ -6,6 +6,8 @@ import './styles.css'
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:5001/api'
 const POLL_MS = 30 * 1000
+const STATUS_MS = 4 * 1000       // de quanto em quanto tempo perguntamos como vai o resumo
+const STATUS_LIMITE_MS = 45 * 60 * 1000  // teto de paciência: aula nenhuma passa disso
 
 // Erro de gateway (502/504) devolve HTML, e `response.json()` estoura com
 // "Unexpected token '<'", que não diz nada. Aqui vira uma mensagem legível.
@@ -253,6 +255,7 @@ function App() {
   const [query, setQuery] = useState('')
   const [loading, setLoading] = useState(true)
   const [selected, setSelected] = useState(null)
+  const [etapa, setEtapa] = useState('')
   const [result, setResult] = useState(null)
   const [error, setError] = useState('')
   const [chat, setChat] = useState([])
@@ -334,20 +337,47 @@ function App() {
     }
   }, [result?.recordingId])
 
+  // O resumo de uma aula longa leva minutos e roda numa thread no servidor, então
+  // aqui só perguntamos de tempos em tempos como ele vai. Fechar a aba não
+  // cancela nada: o material termina lá e aparece na aba de salvos.
+  async function acompanhar(recordingId) {
+    const limite = Date.now() + STATUS_LIMITE_MS
+    while (Date.now() < limite) {
+      await new Promise(resolve => setTimeout(resolve, STATUS_MS))
+      let situacao
+      try {
+        situacao = await lerResposta(await fetch(`${API}/recordings/${recordingId}/status`))
+      } catch { continue }  // rede oscilou; o servidor continua trabalhando
+      if (situacao.etapa) setEtapa(situacao.etapa)
+      if (situacao.estado === 'pronto') return
+      if (situacao.estado === 'erro') throw new Error(situacao.erro || 'Não foi possível resumir esta aula.')
+      if (situacao.estado === 'parado') throw new Error('O servidor reiniciou no meio do resumo. Tente de novo.')
+    }
+    throw new Error('O resumo está demorando demais. Ele continua rodando no servidor: confira a aba de salvos daqui a pouco.')
+  }
+
+  function mostrar(body, recording) {
+    setResult({ ...body, recordingId: recording.id, name: body.nome || recording.name })
+    setAnotacoes(Array.isArray(body.anotacoes) ? body.anotacoes : [])
+    setChat(body.historico || [])
+    carregarSalvos()  // acabou de virar uma resumida; a aba precisa saber
+  }
+
   async function process(recording, forcar = false) {
     setSelected(recording.id); setResult(null); setError(''); setChat([]); setQuestion(''); setSlide(0); setAnotacoes([])
+    setEtapa('Começando…')
     try {
       const body = await lerResposta(await fetch(`${API}/recordings/${recording.id}/process`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ modelo: model, forcar }),
       }))
-      setResult({ ...body, recordingId: recording.id, name: body.nome || recording.name })
-      setAnotacoes(Array.isArray(body.anotacoes) ? body.anotacoes : [])
-      setChat(body.historico || [])
-      carregarSalvos()  // acabou de virar uma resumida; a aba precisa saber
+      if (!body.estado) { mostrar(body, recording); return }  // já estava salvo
+      if (body.etapa) setEtapa(body.etapa)
+      await acompanhar(recording.id)
+      mostrar(await lerResposta(await fetch(`${API}/recordings/${recording.id}/resumo`)), recording)
     } catch (err) { setError(err.message || 'Não foi possível processar o áudio.') }
-    finally { setSelected(null) }
+    finally { setSelected(null); setEtapa('') }
   }
 
   async function editar(mudancas) {
@@ -485,7 +515,8 @@ function App() {
             <div className="thinking"><span /><span /><span /></div>
             <p className="section-label">OUVINDO</p>
             <h2>Já volto com o resumo.</h2>
-            <p>Isso leva um instante.</p>
+            <p>{etapa || 'Isso leva um instante.'}</p>
+            <p className="processing-nota">Aula longa leva alguns minutos. Pode fechar: o resumo termina no servidor e aparece em salvos.</p>
           </div> : result ? <>
             <button className="voltar" onClick={() => { setResult(null); setChat([]) }}>← gravações</button>
             <div className="result-title">

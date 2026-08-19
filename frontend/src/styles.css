@@ -85,3 +85,5 @@
   a{text-decoration:none;color:inherit}
 }
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;scroll-behavior:auto!important}}
+
+.processing-nota{margin-top:14px;font-size:.78rem;color:#9a93a1;line-height:1.5}

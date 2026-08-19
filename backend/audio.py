@@ -8,6 +8,7 @@ então basta somar durações e quebrar entre frames. Sem ffmpeg, sem recodifica
 (o áudio sai idêntico ao original) e sem dependência nova.
 """
 
+import mmap
 from pathlib import Path
 
 # Tabelas do padrão MPEG Audio Layer III.
@@ -58,8 +59,12 @@ def _ler_frame(dados, pos):
 
 
 def _frames(dados, inicio):
-    """Percorre o fluxo uma vez: [(posição, duração em segundos), ...]."""
-    lista, pos = [], inicio
+    """Percorre o fluxo uma vez, entregando (posição, duração) frame a frame.
+
+    Gerador de propósito: uma aula de duas horas tem ~250 mil frames, e guardar
+    isso numa lista custa dezenas de MB à toa.
+    """
+    pos = inicio
     while pos < len(dados):
         frame = _ler_frame(dados, pos)
         if frame is None:
@@ -70,51 +75,76 @@ def _frames(dados, inicio):
             pos = proximo
             continue
         tamanho, duracao = frame
-        lista.append((pos, duracao))
+        yield pos, duracao
         pos += tamanho
-    return lista
 
 
-def planejar(frames, limite_segundos, fim):
+def duracao(dados, inicio):
+    """Duração total em segundos, sem guardar nada além do acumulador."""
+    return sum(passo for _, passo in _frames(dados, inicio))
+
+
+def planejar(frames, total, limite_segundos, fim):
     """Cortes em partes iguais, cada uma dentro do limite.
 
     Fatiar de forma fixa deixaria uma sobra minúscula no fim (80 min em blocos
     de 40 = 40 + 40 + 0,2), e cada sobra dessas custa uma requisição inteira.
     Dividir igualmente evita isso e mantém todos os blocos abaixo do teto.
     """
-    total = sum(duracao for _, duracao in frames)
-    if total <= limite_segundos or not frames:
+    if total <= limite_segundos:
         return []
 
     partes = int(total // limite_segundos) + (1 if total % limite_segundos else 0)
     alvo = total / partes
 
-    cortes, inicio, acumulado, restantes = [], frames[0][0], 0.0, partes
-    for pos, duracao in frames:
+    cortes, inicio, acumulado, restantes = [], None, 0.0, partes
+    for pos, passo in frames:
+        if inicio is None:
+            inicio = pos
         if restantes > 1 and acumulado >= alvo and pos > inicio:
             cortes.append((inicio, pos))
             inicio, acumulado, restantes = pos, 0.0, restantes - 1
-        acumulado += duracao
+        acumulado += passo
+    if inicio is None:
+        return []
     cortes.append((inicio, fim))
     return cortes
+
+
+PEDACO = 4 * 1024 * 1024  # cópia em pedaços: bloco inteiro na RAM não cabe
+
+
+def _copiar(dados, comeco, fim, destino):
+    with open(destino, "wb") as saida:
+        while comeco < fim:
+            ate = min(comeco + PEDACO, fim)
+            saida.write(dados[comeco:ate])
+            comeco = ate
 
 
 def dividir(caminho, segundos_por_bloco, destino=None):
     """Fatia o MP3 e devolve os caminhos dos blocos.
 
-    Se o arquivo não for um MP3 legível, devolve [caminho] — o chamador segue
-    com o arquivo inteiro em vez de falhar.
+    O arquivo é lido por mmap: o sistema pagina o que for preciso em vez de o
+    processo carregar uma aula inteira (mais de 100 MB) na memória. Se não for
+    um MP3 legível, devolve [caminho] — o chamador segue com o arquivo inteiro
+    em vez de falhar.
     """
     origem = Path(caminho)
-    dados = origem.read_bytes()
-    cortes = planejar(_frames(dados, _pular_id3(dados)), segundos_por_bloco, len(dados))
-    if len(cortes) <= 1:
-        return [str(origem)]
+    with open(origem, "rb") as arquivo:
+        with mmap.mmap(arquivo.fileno(), 0, access=mmap.ACCESS_READ) as dados:
+            inicio = _pular_id3(dados[:10])
+            # Duas passadas pelo arquivo mapeado custam menos que uma lista de
+            # 250 mil frames na memória.
+            total = duracao(dados, inicio)
+            cortes = planejar(_frames(dados, inicio), total, segundos_por_bloco, len(dados))
+            if len(cortes) <= 1:
+                return [str(origem)]
 
-    pasta = Path(destino or origem.parent)
-    caminhos = []
-    for indice, (comeco, fim) in enumerate(cortes, start=1):
-        bloco = pasta / f"{origem.stem}-bloco{indice:02d}{origem.suffix}"
-        bloco.write_bytes(dados[comeco:fim])
-        caminhos.append(str(bloco))
-    return caminhos
+            pasta = Path(destino or origem.parent)
+            caminhos = []
+            for indice, (comeco, fim) in enumerate(cortes, start=1):
+                bloco = pasta / f"{origem.stem}-bloco{indice:02d}{origem.suffix}"
+                _copiar(dados, comeco, fim, bloco)
+                caminhos.append(str(bloco))
+            return caminhos

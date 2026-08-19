@@ -8,6 +8,7 @@ Coleções:
 - perguntas  — histórico do chat, ligado pelo recording_id
 - config     — ajustes internos e o token da Plaud, chaveados por _id
 - nomes      — títulos escolhidos à mão, inclusive de gravação ainda sem resumo
+- trabalhos  — resumos em andamento, para o andamento sobreviver a um restart
 """
 
 import os
@@ -148,7 +149,10 @@ def listar_resumos():
     """Só os campos da lista — evita trafegar transcrição e material inteiros."""
     campos = {"recording_id": 1, "nome": 1, "modelo": 1, "gravado_em": 1, "duracao_ms": 1, "criado_em": 1}
     try:
-        return [_limpar(item) for item in _db().resumos.find({}, campos).sort("criado_em", -1)]
+        # `parcial` é aula com transcrição guardada mas sem material ainda: não é
+        # resumo, e mostrar na biblioteca abriria um resumo vazio.
+        busca = {"parcial": {"$ne": True}}
+        return [_limpar(item) for item in _db().resumos.find(busca, campos).sort("criado_em", -1)]
     except StorageError:
         raise
     except Exception as error:
@@ -210,3 +214,40 @@ def buscar_token():
 
 def salvar_token(conteudo):
     salvar_config("plaud_token", conteudo)
+
+
+def salvar_trabalho(recording_id, dados):
+    """Andamento de um resumo. No banco, sobrevive a restart e a mais de um worker."""
+    try:
+        _db().trabalhos.update_one(
+            {"recording_id": recording_id},
+            {"$set": {**dados, "recording_id": recording_id, "atualizado_em": _agora()}},
+            upsert=True,
+        )
+    except StorageError:
+        raise
+    except Exception as error:
+        raise StorageError(f"MongoDB: {error}") from error
+
+
+def buscar_trabalho(recording_id):
+    try:
+        return _limpar(_db().trabalhos.find_one({"recording_id": recording_id}))
+    except StorageError:
+        raise
+    except Exception as error:
+        raise StorageError(f"MongoDB: {error}") from error
+
+
+def limpar_trabalhos(segundos):
+    """Apaga os terminados há mais de `segundos`. Os em curso ficam."""
+    from datetime import timedelta
+    try:
+        _db().trabalhos.delete_many({
+            "estado": {"$ne": "rodando"},
+            "atualizado_em": {"$lt": _agora() - timedelta(seconds=segundos)},
+        })
+    except StorageError:
+        raise
+    except Exception as error:
+        raise StorageError(f"MongoDB: {error}") from error

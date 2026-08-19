@@ -7,7 +7,9 @@ region: nyc
 
 services:
   - name: web
-    instance_size_slug: apps-s-1vcpu-0.5gb
+    # 1 GB: com 0.5 GB o container batia em 90% de RAM numa aula de duas horas
+    # (o MP3 passa de 100 MB) e a instância era derrubada no meio do resumo.
+    instance_size_slug: apps-s-1vcpu-1gb
     instance_count: 1
     http_port: 8080
 
@@ -30,14 +32,35 @@ services:
         type: SECRET
         value: COLE_NO_PAINEL
 
-      - key: SUPABASE_URL
-        scope: RUN_TIME
-        value: https://oymirslixudstdcmdyfw.supabase.co
-
-      - key: SUPABASE_SERVICE_KEY
+      # A persistência é MongoDB desde a migração; o Supabase saiu.
+      - key: MONGODB_URI
         scope: RUN_TIME
         type: SECRET
         value: COLE_NO_PAINEL
+      - key: MONGODB_DB
+        scope: RUN_TIME
+        value: resumos_da_lu
+
+      # Modelo do resumo, com reservas para quando a cota diária do gratuito acaba.
+      - key: GEMINI_MODEL
+        scope: RUN_TIME
+        value: gemini-3.6-flash
+      - key: GEMINI_FALLBACK
+        scope: RUN_TIME
+        value: gemini-3.7-flash,gemini-3.5-flash,gemini-3.1-flash-lite
+      # Teto alto de propósito: o código corta no limite real de cada modelo.
+      # Quanto maior a resposta que cabe, menos requisições a aula gasta.
+      - key: GEMINI_MAX_OUTPUT_TOKENS
+        scope: RUN_TIME
+        value: "200000"
+      # Requisições por minuto do plano gratuito; as chamadas saem espaçadas.
+      - key: GEMINI_RPM
+        scope: RUN_TIME
+        value: "5"
+      # Aula inteira numa transcrição só, quando couber.
+      - key: AUDIO_BLOCO_MINUTOS
+        scope: RUN_TIME
+        value: "120"
 
       # Resumo automático das gravações novas, varrendo a cada 30 segundos.
       - key: AUTO_RESUMO
